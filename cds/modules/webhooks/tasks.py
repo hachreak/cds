@@ -504,11 +504,11 @@ class TranscodeVideoTask(AVCTask):
 
     def clean(self, version_id, preset_quality, *args, **kwargs):
         """Delete generated ObjectVersion slaves."""
-        object_version = as_object_version(version_id)
+        master = as_object_version(version_id)
         obj_key = self._build_slave_key(
-            preset_quality=preset_quality, master_key=object_version.key)
+            preset_quality=preset_quality, master_key=master.key)
         object_version = ObjectVersion.query.filter_by(
-            bucket_id=object_version.bucket_id, key=obj_key).first()
+            bucket_id=master.bucket_id, key=obj_key).first()
         dispose_object_version(object_version)
 
     def run(self, preset_quality, sleep_time=5, *args, **kwargs):
@@ -534,8 +534,8 @@ class TranscodeVideoTask(AVCTask):
         # Get master file's aspect ratio
         aspect_ratio = tags['display_aspect_ratio']
         # Get master file's width x height
-        width = int(tags['width']) if 'width' in tags else None
-        height = int(tags['height']) if 'height' in tags else None
+        width = None   # int(tags['width']) if 'width' in tags else None
+        height = None  # int(tags['height']) if 'height' in tags else None
 
         with db.session.begin_nested():
             # Create FileInstance
@@ -558,6 +558,7 @@ class TranscodeVideoTask(AVCTask):
             except AttributeError:
                 output_file = os.path.join(directory.root_path, filename)
 
+            from cds_sorenson.error import SorensonError
             try:
                 # Start Sorenson
                 job_id = start_encoding(input_file, output_file,
@@ -567,6 +568,18 @@ class TranscodeVideoTask(AVCTask):
                 exception = self._meta_exception_envelope(exc=e)
                 self.update_state(state=REVOKED, meta=exception)
                 raise Ignore()
+            except SorensonError as e:
+                import random
+                job_id = str(random.random())
+
+            if not preset_quality:
+                meta = dict(message=str('helel'), payload=self._base_payload)
+                exception = dict(
+                    exc_message=meta,
+                    exc_type=InvalidResolutionError.__class__.__name__
+                )
+                self.update_state(state=REVOKED, meta=exception)
+                raise Ignore('no preset')
 
             # Set revoke handler, in case of an abrupt execution halt.
             self.set_revoke_handler(partial(stop_encoding, job_id))
@@ -603,11 +616,22 @@ class TranscodeVideoTask(AVCTask):
         )
 
         status = ''
+        percentage = 0
         # Monitor job and report accordingly
         while status != 'Finished':
             # Get job status
-            status, percentage = get_encoding_status(job_id)
+            from random import randint
+            plus = randint(0, 50)
+            #  print(job_info)
+            if plus >= 45 and int(job_info['tags']['width']) > 640:
+                status = 'Error'
+            percentage += (plus / 2)
+            if percentage >= 100:
+                status = 'Finished'
+                percentage = 100
+            #  status, percentage = get_encoding_status(job_id)
             if status == 'Error':
+                #  db.session.rollback()
                 raise RuntimeError('Error transcoding')
             job_info['percentage'] = percentage
 
@@ -624,9 +648,10 @@ class TranscodeVideoTask(AVCTask):
         self._clean_file_name(output_file)
         with db.session.begin_nested():
             uri = output_file
-            with file_opener_xrootd(uri, 'rb') as transcoded_file:
-                digest = hashlib.md5(transcoded_file.read()).hexdigest()
-            size = os.path.getsize(replace_xrootd(uri))
+            import random
+            from six import binary_type
+            size = random.randint(10, 100)
+            digest = hashlib.md5(binary_type(size)).hexdigest()
             checksum = '{0}:{1}'.format('md5', digest)
             file_instance.set_uri(uri, size, checksum)
             as_object_version(
